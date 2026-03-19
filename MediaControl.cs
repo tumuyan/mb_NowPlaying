@@ -1,4 +1,4 @@
-﻿using System;
+﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿using System;
 using System.Threading;
 using System.Runtime.InteropServices;
 using System.Collections.Generic;
@@ -13,6 +13,14 @@ using System.Runtime.InteropServices.WindowsRuntime;
 using Gma.System.MouseKeyHook;
 using System.Windows.Forms;
 using Windows.Media.Control;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+using System.Threading.Tasks;
+using System.Web.Script.Serialization;
+using System.Collections.Concurrent;
+using System.Security.Cryptography;
+using System.Diagnostics;
 
 namespace MusicBeePlugin
 {
@@ -36,24 +44,34 @@ namespace MusicBeePlugin
         private bool trackChangeListenerDisabled = false;
         private System.Threading.Timer timer;
 
+        // Now Playing Server
+        private TcpListener listener;
+        private CancellationTokenSource cts;
+        private ConcurrentBag<WebSocketClient> webSocketClients;
+        private JavaScriptSerializer jsonSerializer;
+
         public PluginInfo Initialise(IntPtr apiInterfacePtr)
         {
             SubscribeGlobalHooks();
             mbApiInterface = new MusicBeeApiInterface();
             mbApiInterface.Initialise(apiInterfacePtr);
             about.PluginInfoVersion = PluginInfoVersion;
-            about.Name = "Media Control";
-            about.Description = "Enables MusicBee to interact with the Windows 10/11 Media Control overlay.";
+            about.Name = "Media Control with Now Playing";
+            about.Description = "Enables MusicBee to interact with the Windows 10/11 Media Control overlay and provides Now Playing API for PV Tool.";
             about.Author = "Steven Mayall";
-            about.TargetApplication = "";   //  the name of a Plugin Storage device or panel header for a dockable panel
+            about.TargetApplication = "";
             about.Type = PluginType.General;
-            about.VersionMajor = 1;  // your plugin version
+            about.VersionMajor = 1;
             about.VersionMinor = 0;
-            about.Revision = 4;
+            about.Revision = 5;
             about.MinInterfaceVersion = MinInterfaceVersion;
             about.MinApiRevision = MinApiRevision;
             about.ReceiveNotifications = (ReceiveNotificationFlags.PlayerEvents | ReceiveNotificationFlags.TagEvents);
-            about.ConfigurationPanelHeight = 0;   // height in pixels that musicbee should reserve in a panel for config settings. When set, a handle to an empty panel will be passed to the Configure function
+            about.ConfigurationPanelHeight = 0;
+            
+            // Initialize Now Playing Server
+            InitializeNowPlayingServer();
+            
             return about;
         }
 
@@ -74,6 +92,10 @@ namespace MusicBeePlugin
             UnsubscribeGlobalHooks();
             SetArtworkThumbnail(null);
             timer.Dispose();
+            
+            // Stop Now Playing Server
+            cts?.Cancel();
+            listener?.Stop();
         }
 
         // uninstall this plugin - clean up any persisted files
@@ -107,6 +129,7 @@ namespace MusicBeePlugin
                     }
                 }
                 SetPlayerState();
+                BroadcastPlayerState();
             }
             finally
             {
@@ -122,6 +145,7 @@ namespace MusicBeePlugin
                 if (DateTime.Now.Subtract(lastStopKeyPress).TotalMilliseconds > mediaKeysInvalidateBeforeMs)
                     mbApiInterface.Player_Stop();
                 SetPlayerState();
+                BroadcastPlayerState();
             }
             finally
             {
@@ -137,6 +161,8 @@ namespace MusicBeePlugin
                 if (DateTime.Now.Subtract(lastPreviousTrackKeyPress).TotalMilliseconds > mediaKeysInvalidateBeforeMs)
                     mbApiInterface.Player_PlayPreviousTrack();
                 SetDisplayValues();
+                BroadcastTrackInfo();
+                BroadcastLyricInfo();
             }
             finally
             {
@@ -152,6 +178,8 @@ namespace MusicBeePlugin
                 if (DateTime.Now.Subtract(lastNextTrackKeyPress).TotalMilliseconds > mediaKeysInvalidateBeforeMs)
                     mbApiInterface.Player_PlayNextTrack();
                 SetDisplayValues();
+                BroadcastTrackInfo();
+                BroadcastLyricInfo();
             }
             finally
             {
@@ -187,14 +215,29 @@ namespace MusicBeePlugin
                     SetDisplayValues();
                     SetShuffleState();
                     SetRepeatState();
+                    BroadcastTrackInfo();
+                    BroadcastLyricInfo();
+                    BroadcastPlayerState();
                     break;
                 case NotificationType.PlayStateChanged:
                     if (!trackChangeListenerDisabled)
+                    {
                         SetPlayerState();
+                        BroadcastPlayerState();
+                    }
                     break;
                 case NotificationType.TrackChanged:
                     if (!trackChangeListenerDisabled)
+                    {
                         SetDisplayValues();
+                        BroadcastTrackInfo();
+                        BroadcastLyricInfo();
+                    }
+                    break;
+                case NotificationType.NowPlayingLyricsReady:
+                    // Lyrics have been downloaded or updated - broadcast to all clients
+                    Debug.WriteLine("Lyrics ready - broadcasting to clients");
+                    BroadcastLyricInfo();
                     break;
                 case NotificationType.PlayerShuffleChanged:
                     if (!trackChangeListenerDisabled)
@@ -205,8 +248,6 @@ namespace MusicBeePlugin
                         SetRepeatState();
                     break;
             }
-
-
         }
 
         private void SystemMediaControls_ButtonPressed(SystemMediaTransportControls smtc, SystemMediaTransportControlsButtonPressedEventArgs args)
@@ -244,7 +285,7 @@ namespace MusicBeePlugin
         private void SystemMediaControls_PlaybackPositionChangeRequested(SystemMediaTransportControls smtc, PlaybackPositionChangeRequestedEventArgs args)
         {
             mbApiInterface.Player_SetPosition((int)args.RequestedPlaybackPosition.TotalMilliseconds);
-
+            BroadcastProgress();
         }
 
         private void SystemMediaControls_PlaybackRateChangeRequested(SystemMediaTransportControls smtc, PlaybackRateChangeRequestedEventArgs args)
@@ -270,7 +311,6 @@ namespace MusicBeePlugin
         private void SystemMediaControls_ShuffleEnabledChangeRequested(SystemMediaTransportControls smtc, ShuffleEnabledChangeRequestedEventArgs args)
         {
             mbApiInterface.Player_SetShuffle(args.RequestedShuffleEnabled);
-
         }
 
         private void SetDisplayValues()
@@ -291,7 +331,6 @@ namespace MusicBeePlugin
                     musicProperties.Title = url.Substring(url.LastIndexOfAny(new char[] { '/', '\\' }) + 1);
                 if (uint.TryParse(mbApiInterface.NowPlaying_GetFileTag(MetaDataType.TrackNo), out value))
                     musicProperties.TrackNumber = value;
-                //musicProperties.Genres = mbApiInterface.NowPlaying_GetFileTag(MetaDataType.Genres).Split(new string[] {"; "}, StringSplitOptions.RemoveEmptyEntries);
                 mbApiInterface.Library_GetArtworkEx(url, 0, true, out _, out _, out var imageData);
                 SetArtworkThumbnail(imageData);
             }
@@ -349,6 +388,7 @@ namespace MusicBeePlugin
             timelineProperties.EndTime = TimeSpan.FromMilliseconds(mbApiInterface.NowPlaying_GetDuration());
 
             systemMediaControls.UpdateTimelineProperties(timelineProperties);
+            BroadcastProgress();
         }
 
         private async void SetArtworkThumbnail(byte[] data)
@@ -403,6 +443,717 @@ namespace MusicBeePlugin
             }
         }
 
-    }
+        // Now Playing Server Implementation
+        private void InitializeNowPlayingServer()
+        {
+            cts = new CancellationTokenSource();
+            webSocketClients = new ConcurrentBag<WebSocketClient>();
+            jsonSerializer = new JavaScriptSerializer();
 
+            // Check if port 9863 is already in use
+            bool isPortInUse = false;
+            try
+            {
+                var testListener = new TcpListener(IPAddress.Any, 9863);
+                testListener.Start();
+                testListener.Stop();
+            }
+            catch (SocketException)
+            {
+                isPortInUse = true;
+            }
+
+            if (isPortInUse)
+            {
+                MessageBox.Show(
+                    "Port 9863 is already in use by another application.\n\n" +
+                    "Please close any other applications using this port (such as another instance of MusicBee or PV Tool) and restart MusicBee.",
+                    "Now Playing Server - Port Conflict",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+                return;
+            }
+
+            // Start server for both HTTP and WebSocket
+            listener = new TcpListener(IPAddress.Any, 9863);
+            listener.Start();
+            Task.Run(() => ServerLoop(listener, cts.Token));
+
+            Debug.WriteLine("Now Playing Server started on port 9863");
+        }
+
+        private async Task ServerLoop(TcpListener listener, CancellationToken token)
+        {
+            while (!token.IsCancellationRequested)
+            {
+                try
+                {
+                    Debug.WriteLine("Waiting for client connection...");
+                    var client = await listener.AcceptTcpClientAsync();
+                    Debug.WriteLine($"Client accepted: {client.Client.RemoteEndPoint}");
+                    Task.Run(() => HandleClient(client));
+                }
+                catch (ObjectDisposedException ex)
+                {
+                    Debug.WriteLine($"Listener disposed: {ex.Message}");
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    if (!token.IsCancellationRequested)
+                    {
+                        Debug.WriteLine($"Server error: {ex.GetType().Name} - {ex.Message}");
+                    }
+                }
+            }
+            Debug.WriteLine("Server loop stopped");
+        }
+
+        private void HandleClient(TcpClient client)
+        {
+            try
+            {
+                Debug.WriteLine($"New client connected from {client.Client.RemoteEndPoint}");
+
+                // Read the request data with timeout
+                client.ReceiveTimeout = 5000; // 5 second timeout
+                var buffer = new byte[4096];
+                int bytesRead = 0;
+                NetworkStream stream = null;
+                
+                try
+                {
+                    stream = client.GetStream();
+                    bytesRead = stream.Read(buffer, 0, buffer.Length);
+                }
+                catch (IOException ex)
+                {
+                    Debug.WriteLine($"Error reading request: {ex.Message}");
+                    client.Close();
+                    return;
+                }
+
+                if (bytesRead == 0)
+                {
+                    Debug.WriteLine("Client sent 0 bytes, closing");
+                    client.Close();
+                    return;
+                }
+
+                var request = Encoding.UTF8.GetString(buffer, 0, bytesRead);
+
+                // Log the request for debugging
+                var firstLine = request.Split(new[] { "\r\n" }, StringSplitOptions.None)[0];
+                Debug.WriteLine($"Received request: {firstLine}");
+
+                // Parse request line to get path
+                string path = "/";
+                var lines = request.Split(new string[] { "\r\n" }, StringSplitOptions.None);
+                if (lines.Length > 0)
+                {
+                    var requestLine = lines[0];
+                    var parts = requestLine.Split(' ');
+                    if (parts.Length >= 2)
+                    {
+                        path = parts[1];
+                    }
+                }
+
+                // Check if it's a WebSocket upgrade request
+                bool isWebSocket = request.IndexOf("Upgrade: websocket", StringComparison.OrdinalIgnoreCase) >= 0;
+
+                Debug.WriteLine($"Path: {path}, IsWebSocket: {isWebSocket}");
+
+                // Check if it's a WebSocket connection request for /api/ws/lyric
+                if (isWebSocket && path == "/api/ws/lyric")
+                {
+                    // Handle WebSocket connection asynchronously
+                    Debug.WriteLine($"WebSocket connection request for path: {path}");
+                    // Don't dispose client here - WebSocketClient will handle it
+                    var webSocketClient = new WebSocketClient(client, webSocketClients, mbApiInterface, jsonSerializer);
+                    webSocketClients.Add(webSocketClient);
+                    Task.Run(() => webSocketClient.Handle(request));
+                }
+                else if (path == "/api/query")
+                {
+                    // Handle HTTP request for /api/query
+                    using (var writer = new StreamWriter(stream, Encoding.UTF8))
+                    {
+                        // Return complete player and track information
+                        var response = GetPlayerInfoResponse();
+                        writer.WriteLine("HTTP/1.1 200 OK");
+                        writer.WriteLine("Content-Type: application/json");
+                        writer.WriteLine("Content-Length: " + Encoding.UTF8.GetByteCount(response));
+                        writer.WriteLine("Access-Control-Allow-Origin: *");
+                        writer.WriteLine("Access-Control-Allow-Methods: GET, POST, OPTIONS");
+                        writer.WriteLine("Access-Control-Allow-Headers: Content-Type");
+                        writer.WriteLine("Connection: close");
+                        writer.WriteLine();
+                        writer.WriteLine(response);
+                        writer.Flush();
+                    }
+                    client.Close();
+                }
+                else
+                {
+                    // Handle other paths (404)
+                    using (var writer = new StreamWriter(stream, Encoding.UTF8))
+                    {
+                        writer.WriteLine("HTTP/1.1 404 Not Found");
+                        writer.WriteLine("Content-Type: text/plain");
+                        writer.WriteLine("Connection: close");
+                        writer.WriteLine();
+                        writer.WriteLine("404 Not Found - Path: " + path);
+                        writer.Flush();
+                    }
+                    client.Close();
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Client handling error: {ex.GetType().Name} - {ex.Message}");
+                try { client.Close(); } catch { }
+            }
+        }
+
+        private void BroadcastTrackInfo()
+        {
+            var url = mbApiInterface.NowPlaying_GetFileUrl();
+            if (url == null)
+                return;
+
+            var trackInfo = new
+            {
+                @event = "Track",
+                data = new
+                {
+                    title = mbApiInterface.NowPlaying_GetFileTag(MetaDataType.TrackTitle) ?? "",
+                    author = mbApiInterface.NowPlaying_GetFileTag(MetaDataType.Artist) ?? "",
+                    cover = "", // TODO: Implement cover art URL
+                    duration = mbApiInterface.NowPlaying_GetDuration(),
+                    album = mbApiInterface.NowPlaying_GetFileTag(MetaDataType.Album) ?? ""
+                }
+            };
+
+            BroadcastMessage(trackInfo);
+        }
+
+        private void BroadcastLyricInfo()
+        {
+            var url = mbApiInterface.NowPlaying_GetFileUrl();
+            if (url == null)
+                return;
+
+            // Get lyrics from MusicBee
+            string lrc = null;
+            try
+            {
+                // Try to get lyrics using MusicBee API
+                lrc = mbApiInterface.NowPlaying_GetLyrics();
+                
+                // If no lyrics found, try downloaded lyrics
+                if (string.IsNullOrEmpty(lrc))
+                {
+                    lrc = mbApiInterface.NowPlaying_GetDownloadedLyrics();
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Error getting lyrics: {ex.Message}");
+            }
+
+            var lyricInfo = new
+            {
+                @event = "Lyric",
+                data = new
+                {
+                    hasLyric = !string.IsNullOrEmpty(lrc),
+                    lrc = lrc
+                }
+            };
+
+            BroadcastMessage(lyricInfo);
+        }
+
+        private void BroadcastPlayerState()
+        {
+            var isPaused = mbApiInterface.Player_GetPlayState() == PlayState.Paused;
+            
+            var pauseInfo = new
+            {
+                @event = "PlayerPauseState",
+                data = new
+                {
+                    isPaused = isPaused
+                }
+            };
+
+            BroadcastMessage(pauseInfo);
+        }
+
+        private void BroadcastProgress()
+        {
+            var progress = mbApiInterface.Player_GetPosition();
+            
+            var progressInfo = new
+            {
+                @event = "PlayerProgress",
+                data = new
+                {
+                    progress = progress
+                }
+            };
+
+            BroadcastMessage(progressInfo);
+        }
+
+        private void BroadcastReplay()
+        {
+            var replayInfo = new
+            {
+                @event = "PlayerProgressReplay",
+                data = new { }
+            };
+
+            BroadcastMessage(replayInfo);
+        }
+
+        private void BroadcastMessage(object message)
+        {
+            var json = jsonSerializer.Serialize(message);
+            var data = Encoding.UTF8.GetBytes(json);
+
+            // Create a copy of the clients list to avoid concurrent modification issues
+            var clientsCopy = webSocketClients.ToArray();
+            foreach (var client in clientsCopy)
+            {
+                client.Send(data);
+            }
+        }
+
+        private string GetPlayerInfoResponse()
+        {
+            var url = mbApiInterface.NowPlaying_GetFileUrl();
+            var hasSong = !string.IsNullOrEmpty(url);
+            var isPaused = mbApiInterface.Player_GetPlayState() == PlayState.Paused;
+            var volumePercent = (int)(mbApiInterface.Player_GetVolume() * 100);
+            var currentPosition = mbApiInterface.Player_GetPosition();
+            var duration = mbApiInterface.NowPlaying_GetDuration();
+            var statePercent = duration > 0 ? (double)currentPosition / duration : 0;
+
+            // Get repeat type
+            string repeatType;
+            switch (mbApiInterface.Player_GetRepeat())
+            {
+                case RepeatMode.None:
+                    repeatType = "NONE";
+                    break;
+                case RepeatMode.One:
+                    repeatType = "ONE";
+                    break;
+                case RepeatMode.All:
+                    repeatType = "ALL";
+                    break;
+                default:
+                    repeatType = "NONE";
+                    break;
+            }
+
+            // Format time
+            string FormatTime(int milliseconds)
+            {
+                var totalSeconds = milliseconds / 1000;
+                var minutes = totalSeconds / 60;
+                var seconds = totalSeconds % 60;
+                return $"{minutes}:{seconds:D2}";
+            }
+
+            var playerInfo = new
+            {
+                player = new
+                {
+                    hasSong = hasSong,
+                    isPaused = isPaused,
+                    volumePercent = volumePercent,
+                    seekbarCurrentPosition = currentPosition / 1000, // Convert to seconds
+                    seekbarCurrentPositionHuman = FormatTime(currentPosition),
+                    statePercent = statePercent,
+                    likeStatus = "INDIFFERENT",
+                    repeatType = repeatType
+                },
+                track = hasSong ? new
+                {
+                    author = mbApiInterface.NowPlaying_GetFileTag(MetaDataType.Artist) ?? "",
+                    title = mbApiInterface.NowPlaying_GetFileTag(MetaDataType.TrackTitle) ?? "",
+                    album = mbApiInterface.NowPlaying_GetFileTag(MetaDataType.Album) ?? "",
+                    cover = "", // TODO: Implement cover art URL
+                    duration = duration / 1000, // Convert to seconds
+                    durationHuman = FormatTime(duration),
+                    url = "", // TODO: Implement track URL
+                    id = "", // TODO: Implement track ID
+                    isVideo = false,
+                    isAdvertisement = false,
+                    inLibrary = true
+                } : new
+                {
+                    author = "",
+                    title = "",
+                    album = "",
+                    cover = "",
+                    duration = 0,
+                    durationHuman = "0:00",
+                    url = "",
+                    id = "",
+                    isVideo = false,
+                    isAdvertisement = false,
+                    inLibrary = false
+                }
+            };
+
+            return jsonSerializer.Serialize(playerInfo);
+        }
+
+        private class WebSocketClient
+        {
+            private TcpClient client;
+            private NetworkStream stream;
+            private ConcurrentBag<WebSocketClient> clients;
+            private MusicBeeApiInterface mbApiInterface;
+            private JavaScriptSerializer jsonSerializer;
+
+            public WebSocketClient(TcpClient client, ConcurrentBag<WebSocketClient> clients, MusicBeeApiInterface mbApiInterface, JavaScriptSerializer jsonSerializer)
+            {
+                this.client = client;
+                this.stream = client.GetStream();
+                this.clients = clients;
+                this.mbApiInterface = mbApiInterface;
+                this.jsonSerializer = jsonSerializer;
+            }
+
+            public async Task Handle(string request)
+            {
+                try
+                {
+                    // WebSocket handshake
+                    await PerformHandshake(request);
+
+                    Debug.WriteLine("WebSocket connection established");
+
+                    // Send initial data to client immediately after connection
+                    SendTrackInfo();
+                    SendLyricInfo();
+                    SendPlayerState();
+                    SendProgress();
+
+                    // Handle messages and keep connection alive
+                    var buffer = new byte[4096];
+                    while (client.Connected)
+                    {
+                        try
+                        {
+                            // Check if stream is available
+                            if (stream == null)
+                            {
+                                Debug.WriteLine("Stream is null, closing connection");
+                                break;
+                            }
+
+                            // Set a timeout for reading to allow periodic checks
+                            if (stream.DataAvailable)
+                            {
+                                var bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length);
+                                if (bytesRead == 0)
+                                {
+                                    Debug.WriteLine("Client sent 0 bytes, closing");
+                                    break;
+                                }
+
+                                // Simple WebSocket frame handling
+                                // For production use, implement proper WebSocket frame parsing
+                            }
+                            else
+                            {
+                                // No data available, wait a bit before checking again
+                                await Task.Delay(100);
+                            }
+                        }
+                        catch (ObjectDisposedException ex)
+                        {
+                            // Stream or client has been disposed
+                            Debug.WriteLine($"Object disposed: {ex.Message}");
+                            break;
+                        }
+                        catch (IOException ex)
+                        {
+                            // Network error, likely client disconnected
+                            Debug.WriteLine($"IO error: {ex.Message}");
+                            break;
+                        }
+                        catch (Exception ex)
+                        {
+                            // Ignore read errors, likely due to client disconnect
+                            Debug.WriteLine($"WebSocket read error: {ex.Message}");
+                            if (!client.Connected)
+                                break;
+                        }
+                    }
+                }
+                catch (ObjectDisposedException ex)
+                {
+                    Debug.WriteLine($"Object disposed in handler: {ex.Message}");
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"WebSocket client error: {ex.Message}");
+                }
+                finally
+                {
+                    Debug.WriteLine("WebSocket connection closed");
+                    // Remove client from the list
+                    clients.TryTake(out _);
+                    // Clean up resources
+                    try
+                    {
+                        stream?.Close();
+                        client?.Close();
+                    }
+                    catch { }
+                }
+            }
+
+            private void SendTrackInfo()
+            {
+                var url = mbApiInterface.NowPlaying_GetFileUrl();
+                if (url == null)
+                    return;
+
+                var trackInfo = new
+                {
+                    @event = "Track",
+                    data = new
+                    {
+                        title = mbApiInterface.NowPlaying_GetFileTag(MetaDataType.TrackTitle) ?? "",
+                        author = mbApiInterface.NowPlaying_GetFileTag(MetaDataType.Artist) ?? "",
+                        cover = "", // TODO: Implement cover art URL
+                        duration = mbApiInterface.NowPlaying_GetDuration(),
+                        album = mbApiInterface.NowPlaying_GetFileTag(MetaDataType.Album) ?? ""
+                    }
+                };
+
+                SendMessage(trackInfo);
+            }
+
+            private void SendLyricInfo()
+            {
+                var url = mbApiInterface.NowPlaying_GetFileUrl();
+                if (url == null)
+                    return;
+
+                // Get lyrics from MusicBee
+                string lrc = null;
+                try
+                {
+                    // Try to get lyrics using MusicBee API
+                    lrc = mbApiInterface.NowPlaying_GetLyrics();
+                    
+                    // If no lyrics found, try downloaded lyrics
+                    if (string.IsNullOrEmpty(lrc))
+                    {
+                        lrc = mbApiInterface.NowPlaying_GetDownloadedLyrics();
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"Error getting lyrics: {ex.Message}");
+                }
+
+                var lyricInfo = new
+                {
+                    @event = "Lyric",
+                    data = new
+                    {
+                        hasLyric = !string.IsNullOrEmpty(lrc),
+                        lrc = lrc
+                    }
+                };
+
+                SendMessage(lyricInfo);
+            }
+
+            private void SendPlayerState()
+            {
+                var isPaused = mbApiInterface.Player_GetPlayState() == PlayState.Paused;
+                
+                var pauseInfo = new
+                {
+                    @event = "PlayerPauseState",
+                    data = new
+                    {
+                        isPaused = isPaused
+                    }
+                };
+
+                SendMessage(pauseInfo);
+            }
+
+            private void SendProgress()
+            {
+                var progress = mbApiInterface.Player_GetPosition();
+                
+                var progressInfo = new
+                {
+                    @event = "PlayerProgress",
+                    data = new
+                    {
+                        progress = progress
+                    }
+                };
+
+                SendMessage(progressInfo);
+            }
+
+            private void SendMessage(object message)
+            {
+                try
+                {
+                    if (!client.Connected || stream == null)
+                        return;
+
+                    var json = jsonSerializer.Serialize(message);
+                    var data = Encoding.UTF8.GetBytes(json);
+
+                    // Create proper WebSocket frame
+                    using (var ms = new MemoryStream())
+                    {
+                        // Byte 0: FIN=1, opcode=1 (text frame)
+                        ms.WriteByte(0x81);
+
+                        // Byte 1+: Payload length with masking bit clear (server to client doesn't need masking)
+                        if (data.Length < 126)
+                        {
+                            ms.WriteByte((byte)data.Length);
+                        }
+                        else if (data.Length < 65536)
+                        {
+                            ms.WriteByte(126);
+                            ms.WriteByte((byte)((data.Length >> 8) & 0xFF));
+                            ms.WriteByte((byte)(data.Length & 0xFF));
+                        }
+                        else
+                        {
+                            ms.WriteByte(127);
+                            // 8 bytes for extended payload length (big-endian)
+                            byte[] lengthBytes = BitConverter.GetBytes((long)data.Length);
+                            if (BitConverter.IsLittleEndian)
+                                Array.Reverse(lengthBytes);
+                            ms.Write(lengthBytes, 0, lengthBytes.Length);
+                        }
+
+                        // Payload
+                        ms.Write(data, 0, data.Length);
+
+                        // Send the frame
+                        var frame = ms.ToArray();
+                        stream.Write(frame, 0, frame.Length);
+                        stream.Flush();
+                    }
+                }
+                catch (ObjectDisposedException)
+                {
+                    // Client has disconnected, ignore
+                    Debug.WriteLine("Client disconnected while sending message");
+                }
+                catch (IOException ex)
+                {
+                    // Network error, likely client disconnected
+                    Debug.WriteLine($"IO error sending message: {ex.Message}");
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"Send message error: {ex.Message}");
+                }
+            }
+
+            private async Task PerformHandshake(string request)
+            {
+                try
+                {
+                    // Extract Sec-WebSocket-Key from request
+                    string secWebSocketKey = "";
+                    var lines = request.Split(new string[] { "\r\n" }, StringSplitOptions.None);
+                    foreach (var line in lines)
+                    {
+                        if (line.StartsWith("Sec-WebSocket-Key: "))
+                        {
+                            secWebSocketKey = line.Substring("Sec-WebSocket-Key: ".Length).Trim();
+                            break;
+                        }
+                    }
+
+                    // Calculate Sec-WebSocket-Accept
+                    string secWebSocketAccept = "";
+                    if (!string.IsNullOrEmpty(secWebSocketKey))
+                    {
+                        string magic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+                        string combined = secWebSocketKey + magic;
+                        byte[] combinedBytes = Encoding.UTF8.GetBytes(combined);
+                        byte[] hashBytes;
+                        using (SHA1 sha1 = SHA1.Create())
+                        {
+                            hashBytes = sha1.ComputeHash(combinedBytes);
+                        }
+                        secWebSocketAccept = Convert.ToBase64String(hashBytes);
+                    }
+
+                    Debug.WriteLine($"Sec-WebSocket-Key: {secWebSocketKey}");
+                    Debug.WriteLine($"Sec-WebSocket-Accept: {secWebSocketAccept}");
+
+                    // WebSocket handshake response
+                    var response = "HTTP/1.1 101 Switching Protocols\r\n" +
+                                  "Upgrade: websocket\r\n" +
+                                  "Connection: Upgrade\r\n" +
+                                  "Sec-WebSocket-Accept: " + secWebSocketAccept + "\r\n" +
+                                  "\r\n";
+                    var responseBytes = Encoding.UTF8.GetBytes(response);
+                    await stream.WriteAsync(responseBytes, 0, responseBytes.Length);
+                    await stream.FlushAsync();
+
+                    Debug.WriteLine("WebSocket handshake response sent");
+                }
+                catch (ObjectDisposedException ex)
+                {
+                    Debug.WriteLine($"Stream disposed during handshake: {ex.Message}");
+                    throw;
+                }
+                catch (IOException ex)
+                {
+                    Debug.WriteLine($"IO error during handshake: {ex.Message}");
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"WebSocket handshake error: {ex.Message}");
+                    throw;
+                }
+            }
+
+            public void Send(byte[] data)
+            {
+                try
+                {
+                    if (client.Connected && stream != null)
+                    {
+                        // Simple WebSocket frame wrapper
+                        var frame = new byte[data.Length + 2];
+                        frame[0] = 0x81; // Text frame
+                        frame[1] = (byte)data.Length;
+                        Array.Copy(data, 0, frame, 2, data.Length);
+                        stream.Write(frame, 0, frame.Length);
+                    }
+                }
+                catch { }
+            }
+        }
+
+    }
 }
