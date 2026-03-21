@@ -1,4 +1,4 @@
-﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿using System;
+﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿using System;
 using System.Threading;
 using System.Runtime.InteropServices;
 using System.Collections.Generic;
@@ -58,7 +58,7 @@ namespace MusicBeePlugin
             about.PluginInfoVersion = PluginInfoVersion;
             about.Name = "Media Control with Now Playing";
             about.Description = "Enables MusicBee to interact with the Windows 10/11 Media Control overlay and provides Now Playing API for PV Tool.";
-            about.Author = "Steven Mayall";
+            about.Author = "tumuyan";
             about.TargetApplication = "";
             about.Type = PluginType.General;
             about.VersionMajor = 1;
