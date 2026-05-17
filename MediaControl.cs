@@ -54,6 +54,7 @@ namespace MusicBeePlugin
 
         private string dataPath;
         public bool isSplitTranslation = false;
+        public bool isSkipText = false;
         public PluginInfo Initialise(IntPtr apiInterfacePtr)
         {
             SubscribeGlobalHooks();
@@ -75,7 +76,7 @@ namespace MusicBeePlugin
             // Initialize Now Playing Server
             InitializeNowPlayingServer();
 
-            about.ConfigurationPanelHeight = 40;   // height in pixels that musicbee should reserve in a panel for config settings. When set, a handle to an empty panel will be passed to the Configure function
+            about.ConfigurationPanelHeight = 72;   // height in pixels that musicbee should reserve in a panel for config settings. When set, a handle to an empty panel will be passed to the Configure function
 
             dataPath = mbApiInterface.Setting_GetPersistentStoragePath()+ "NowPlaying_Config.conf";
             if (File.Exists(dataPath))
@@ -93,6 +94,10 @@ namespace MusicBeePlugin
                         {
                             isSplitTranslation = result;
                         }
+                        if (key == "SkipText" && bool.TryParse(value, out var skipResult))
+                        {
+                            isSkipText = skipResult;
+                        }
                     }
                 }
             } 
@@ -102,6 +107,7 @@ namespace MusicBeePlugin
         }
 
         private CheckBox cbSplitTranslation;
+        private CheckBox cbSkipText;
 
         public bool Configure(IntPtr panelHandle)
         {
@@ -116,11 +122,17 @@ namespace MusicBeePlugin
                     Checked = isSplitTranslation,
                     AutoSize = true
                 };
-                //cbSplitTranslation.Text = "Split lyric translation by '/'";
-                //cbSplitTranslation.Checked = isSplitTranslation;
-                //cbSplitTranslation.Location = new System.Drawing.Point(0, 0);
-                //cbSplitTranslation.CheckedChanged += new EventHandler(cbSplitTranslation_CheckedChanged);  
-                configPanel.Controls.AddRange(new Control[] { cbSplitTranslation });
+
+                cbSkipText = new CheckBox
+                {
+                    Text = "Skip lyric without time tag",
+                    Location = new Point(0, 40),
+                    Checked = isSkipText,
+                    AutoSize = true
+                };
+                //cbSplitTranslation.CheckedChanged += cbSplitTranslation_CheckedChanged;
+                //cbSkipText.CheckedChanged += cbSkipText_CheckedChanged;
+                configPanel.Controls.AddRange(new Control[] { cbSplitTranslation, cbSkipText });
             }
             return false;
         }
@@ -134,14 +146,22 @@ namespace MusicBeePlugin
             Console.WriteLine($"isSplitTranslation changed -> {isSplitTranslation}");
         }
 
+        private void cbSkipText_CheckedChanged(object sender, EventArgs e)
+        {
+            CheckBox cb = (CheckBox)sender;
+            isSkipText = cb.Checked;
+            Console.WriteLine($"isSkipText changed -> {isSkipText}");
+        }
+
 
         // called by MusicBee when the user clicks Apply or Save in the MusicBee Preferences screen.
         // its up to you to figure out whether anything has changed and needs updating
         public void SaveSettings()
         {
             isSplitTranslation = cbSplitTranslation.Checked;
+            isSkipText = cbSkipText.Checked;
 
-            File.WriteAllText(dataPath, "SplitTranslation:" + isSplitTranslation.ToString());
+            File.WriteAllText(dataPath, "SplitTranslation:" + isSplitTranslation.ToString() + "\nSkipText:" + isSkipText.ToString());
         }
 
         // MusicBee is closing the plugin (plugin is being disabled by user or MusicBee is shutting down)
@@ -149,7 +169,7 @@ namespace MusicBeePlugin
         {
             UnsubscribeGlobalHooks();
             SetArtworkThumbnail(null);
-            timer.Dispose();
+            timer?.Dispose();
             
             // Stop Now Playing Server
             cts?.Cancel();
@@ -701,13 +721,16 @@ namespace MusicBeePlugin
             string lrc = null;
             try
             {
-                // Try to get lyrics using MusicBee API
                 lrc = mbApiInterface.NowPlaying_GetLyrics();
 
-                // If no lyrics found, try downloaded lyrics
                 if (string.IsNullOrEmpty(lrc))
                 {
                     lrc = mbApiInterface.NowPlaying_GetDownloadedLyrics();
+                }
+
+                if (isSkipText && !string.IsNullOrEmpty(lrc) && !lrc.TrimStart().StartsWith("["))
+                {
+                    return null;
                 }
 
                 if (isSplitTranslation)
