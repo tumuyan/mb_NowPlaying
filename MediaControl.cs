@@ -1,4 +1,4 @@
-﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿using System;
+﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿using System;
 using System.Threading;
 using System.Runtime.InteropServices;
 using System.Collections.Generic;
@@ -32,6 +32,7 @@ namespace MusicBeePlugin
         private SystemMediaTransportControlsDisplayUpdater displayUpdater;
         private MusicDisplayProperties musicProperties;
         private InMemoryRandomAccessStream artworkStream;
+        private byte[] currentArtworkData;
 
         private IKeyboardMouseEvents globalHook;
         // Disable this...
@@ -239,6 +240,12 @@ namespace MusicBeePlugin
                     Debug.WriteLine("Lyrics ready - broadcasting to clients");
                     BroadcastLyricInfo();
                     break;
+                case NotificationType.NowPlayingArtworkReady:
+                    // Artwork has been matched or downloaded - refresh cover art
+                    Debug.WriteLine("Artwork ready - refreshing cover art");
+                    SetDisplayValues();
+                    BroadcastTrackInfo();
+                    break;
                 case NotificationType.PlayerShuffleChanged:
                     if (!trackChangeListenerDisabled)
                         SetShuffleState();
@@ -395,19 +402,36 @@ namespace MusicBeePlugin
         {
             if (artworkStream != null)
                 artworkStream.Dispose();
-            if (data == null)
+            currentArtworkData = data;
+            if (data == null || data.Length == 0)
             {
                 artworkStream = null;
                 displayUpdater.Thumbnail = null;
             }
             else
             {
-                new MemoryStream(data).AsInputStream();
-
                 artworkStream = new InMemoryRandomAccessStream();
                 await artworkStream.WriteAsync(data.AsBuffer());
+                artworkStream.Seek(0);
                 displayUpdater.Thumbnail = RandomAccessStreamReference.CreateFromStream(artworkStream);
             }
+        }
+
+        private string DetectImageContentType(byte[] data)
+        {
+            if (data == null || data.Length < 4)
+                return "image/jpeg";
+            if (data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF)
+                return "image/jpeg";
+            if (data[0] == 0x89 && data[1] == 0x50 && data[2] == 0x4E && data[3] == 0x47)
+                return "image/png";
+            if (data[0] == 0x47 && data[1] == 0x49 && data[2] == 0x46)
+                return "image/gif";
+            if (data[0] == 0x42 && data[1] == 0x4D)
+                return "image/bmp";
+            if (data[0] == 0x52 && data[1] == 0x49 && data[2] == 0x46 && data[3] == 0x46)
+                return "image/webp";
+            return "image/jpeg";
         }
 
         private void SubscribeGlobalHooks()
@@ -540,7 +564,17 @@ namespace MusicBeePlugin
                     return;
                 }
 
-                var request = Encoding.UTF8.GetString(buffer, 0, bytesRead);
+                string request;
+                try
+                {
+                    request = Encoding.UTF8.GetString(buffer, 0, bytesRead);
+                }
+                catch (DecoderFallbackException ex)
+                {
+                    Debug.WriteLine($"Invalid UTF-8 data received from {client.Client.RemoteEndPoint}: {ex.Message}");
+                    try { client.Close(); } catch { }
+                    return;
+                }
 
                 // Log the request for debugging
                 var firstLine = request.Split(new[] { "\r\n" }, StringSplitOptions.None)[0];
@@ -570,9 +604,41 @@ namespace MusicBeePlugin
                     // Handle WebSocket connection asynchronously
                     Debug.WriteLine($"WebSocket connection request for path: {path}");
                     // Don't dispose client here - WebSocketClient will handle it
-                    var webSocketClient = new WebSocketClient(client, webSocketClients, mbApiInterface, jsonSerializer);
+                    var webSocketClient = new WebSocketClient(client, webSocketClients, mbApiInterface, jsonSerializer, () => currentArtworkData);
                     webSocketClients.Add(webSocketClient);
                     Task.Run(() => webSocketClient.Handle(request));
+                }
+                else if (path == "/api/cover")
+                {
+                    if (currentArtworkData != null && currentArtworkData.Length > 0)
+                    {
+                        string contentType = DetectImageContentType(currentArtworkData);
+                        using (var writer = new StreamWriter(stream, Encoding.UTF8))
+                        {
+                            writer.WriteLine("HTTP/1.1 200 OK");
+                            writer.WriteLine($"Content-Type: {contentType}");
+                            writer.WriteLine("Content-Length: " + currentArtworkData.Length);
+                            writer.WriteLine("Access-Control-Allow-Origin: *");
+                            writer.WriteLine("Cache-Control: no-cache");
+                            writer.WriteLine("Connection: close");
+                            writer.WriteLine();
+                            writer.Flush();
+                        }
+                        stream.Write(currentArtworkData, 0, currentArtworkData.Length);
+                    }
+                    else
+                    {
+                        using (var writer = new StreamWriter(stream, Encoding.UTF8))
+                        {
+                            writer.WriteLine("HTTP/1.1 404 Not Found");
+                            writer.WriteLine("Content-Type: text/plain");
+                            writer.WriteLine("Connection: close");
+                            writer.WriteLine();
+                            writer.WriteLine("No cover art available");
+                            writer.Flush();
+                        }
+                    }
+                    client.Close();
                 }
                 else if (path == "/api/query")
                 {
@@ -629,7 +695,7 @@ namespace MusicBeePlugin
                 {
                     title = mbApiInterface.NowPlaying_GetFileTag(MetaDataType.TrackTitle) ?? "",
                     author = mbApiInterface.NowPlaying_GetFileTag(MetaDataType.Artist) ?? "",
-                    cover = "", // TODO: Implement cover art URL
+                    cover = currentArtworkData != null ? Convert.ToBase64String(currentArtworkData) : "",
                     duration = mbApiInterface.NowPlaying_GetDuration(),
                     album = mbApiInterface.NowPlaying_GetFileTag(MetaDataType.Album) ?? ""
                 }
@@ -786,7 +852,7 @@ namespace MusicBeePlugin
                     author = mbApiInterface.NowPlaying_GetFileTag(MetaDataType.Artist) ?? "",
                     title = mbApiInterface.NowPlaying_GetFileTag(MetaDataType.TrackTitle) ?? "",
                     album = mbApiInterface.NowPlaying_GetFileTag(MetaDataType.Album) ?? "",
-                    cover = "", // TODO: Implement cover art URL
+                    cover = currentArtworkData != null ? Convert.ToBase64String(currentArtworkData) : "",
                     duration = duration / 1000, // Convert to seconds
                     durationHuman = FormatTime(duration),
                     url = "", // TODO: Implement track URL
@@ -820,14 +886,16 @@ namespace MusicBeePlugin
             private ConcurrentBag<WebSocketClient> clients;
             private MusicBeeApiInterface mbApiInterface;
             private JavaScriptSerializer jsonSerializer;
+            private Func<byte[]> getArtworkData;
 
-            public WebSocketClient(TcpClient client, ConcurrentBag<WebSocketClient> clients, MusicBeeApiInterface mbApiInterface, JavaScriptSerializer jsonSerializer)
+            public WebSocketClient(TcpClient client, ConcurrentBag<WebSocketClient> clients, MusicBeeApiInterface mbApiInterface, JavaScriptSerializer jsonSerializer, Func<byte[]> getArtworkData)
             {
                 this.client = client;
                 this.stream = client.GetStream();
                 this.clients = clients;
                 this.mbApiInterface = mbApiInterface;
                 this.jsonSerializer = jsonSerializer;
+                this.getArtworkData = getArtworkData;
             }
 
             public async Task Handle(string request)
@@ -934,7 +1002,7 @@ namespace MusicBeePlugin
                     {
                         title = mbApiInterface.NowPlaying_GetFileTag(MetaDataType.TrackTitle) ?? "",
                         author = mbApiInterface.NowPlaying_GetFileTag(MetaDataType.Artist) ?? "",
-                        cover = "", // TODO: Implement cover art URL
+                        cover = getArtworkData() != null ? Convert.ToBase64String(getArtworkData()) : "",
                         duration = mbApiInterface.NowPlaying_GetDuration(),
                         album = mbApiInterface.NowPlaying_GetFileTag(MetaDataType.Album) ?? ""
                     }
