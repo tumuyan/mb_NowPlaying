@@ -1,5 +1,5 @@
 ﻿using Gma.System.MouseKeyHook;
-﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿using System;
+using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -1241,12 +1241,33 @@ namespace MusicBeePlugin
                 {
                     if (client.Connected && stream != null)
                     {
-                        // Simple WebSocket frame wrapper
-                        var frame = new byte[data.Length + 2];
-                        frame[0] = 0x81; // Text frame
-                        frame[1] = (byte)data.Length;
-                        Array.Copy(data, 0, frame, 2, data.Length);
-                        stream.Write(frame, 0, frame.Length);
+                        using (var ms = new MemoryStream())
+                        {
+                            ms.WriteByte(0x81);
+
+                            if (data.Length < 126)
+                            {
+                                ms.WriteByte((byte)data.Length);
+                            }
+                            else if (data.Length < 65536)
+                            {
+                                ms.WriteByte(126);
+                                ms.WriteByte((byte)((data.Length >> 8) & 0xFF));
+                                ms.WriteByte((byte)(data.Length & 0xFF));
+                            }
+                            else
+                            {
+                                ms.WriteByte(127);
+                                byte[] lengthBytes = BitConverter.GetBytes((long)data.Length);
+                                if (BitConverter.IsLittleEndian)
+                                    Array.Reverse(lengthBytes);
+                                ms.Write(lengthBytes, 0, lengthBytes.Length);
+                            }
+
+                            ms.Write(data, 0, data.Length);
+                            var frame = ms.ToArray();
+                            stream.Write(frame, 0, frame.Length);
+                        }
                     }
                 }
                 catch { }
