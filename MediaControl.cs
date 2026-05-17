@@ -1,26 +1,28 @@
-﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿using System;
-using System.Threading;
-using System.Runtime.InteropServices;
+﻿using Gma.System.MouseKeyHook;
+﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Net;
+using System.Net.Sockets;
+using System.Runtime.InteropServices;
+using System.Runtime.InteropServices.WindowsRuntime;
+using System.Security.Cryptography;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Web.Script.Serialization;
+using System.Windows.Forms;
 using Windows.Media;
+using Windows.Media.Control;
 using Windows.Media.Core;
 using Windows.Media.Playback;
 using Windows.Storage;
 using Windows.Storage.Streams;
 using static System.IO.WindowsRuntimeStreamExtensions;
-using System.IO;
-using System.Runtime.InteropServices.WindowsRuntime;
-using Gma.System.MouseKeyHook;
-using System.Windows.Forms;
-using Windows.Media.Control;
-using System.Net;
-using System.Net.Sockets;
-using System.Text;
-using System.Threading.Tasks;
-using System.Web.Script.Serialization;
-using System.Collections.Concurrent;
-using System.Security.Cryptography;
-using System.Diagnostics;
+using System.Drawing;
 
 namespace MusicBeePlugin
 {
@@ -50,6 +52,8 @@ namespace MusicBeePlugin
         private ConcurrentBag<WebSocketClient> webSocketClients;
         private JavaScriptSerializer jsonSerializer;
 
+        private string dataPath;
+        public bool isSplitTranslation = false;
         public PluginInfo Initialise(IntPtr apiInterfacePtr)
         {
             SubscribeGlobalHooks();
@@ -67,23 +71,77 @@ namespace MusicBeePlugin
             about.MinInterfaceVersion = MinInterfaceVersion;
             about.MinApiRevision = MinApiRevision;
             about.ReceiveNotifications = (ReceiveNotificationFlags.PlayerEvents | ReceiveNotificationFlags.TagEvents);
-            about.ConfigurationPanelHeight = 0;
             
             // Initialize Now Playing Server
             InitializeNowPlayingServer();
-            
+
+            about.ConfigurationPanelHeight = 40;   // height in pixels that musicbee should reserve in a panel for config settings. When set, a handle to an empty panel will be passed to the Configure function
+
+            dataPath = mbApiInterface.Setting_GetPersistentStoragePath()+ "NowPlaying_Config.conf";
+            if (File.Exists(dataPath))
+            {
+                var str = File.ReadAllText(dataPath);
+                var conf = str.Split('\n');
+                foreach(var line in conf)
+                {
+                    var kv = line.Split(new char[] { ':' }, 2);
+                    if (kv.Length == 2)
+                    {
+                        var key = kv[0].Trim();
+                        var value = kv[1].Trim();
+                        if (key == "SplitTranslation" && bool.TryParse(value, out var result))
+                        {
+                            isSplitTranslation = result;
+                        }
+                    }
+                }
+            } 
+                
+
             return about;
         }
 
+        private CheckBox cbSplitTranslation;
+
         public bool Configure(IntPtr panelHandle)
         {
+            if (panelHandle != IntPtr.Zero)
+            {
+                Panel configPanel = (Panel)Panel.FromHandle(panelHandle);
+                configPanel.Controls.Clear();
+                cbSplitTranslation = new CheckBox
+                {
+                    Text = "Split lyric translation by '/'",
+                    Location = new Point(0, 0),
+                    Checked = isSplitTranslation,
+                    AutoSize = true
+                };
+                //cbSplitTranslation.Text = "Split lyric translation by '/'";
+                //cbSplitTranslation.Checked = isSplitTranslation;
+                //cbSplitTranslation.Location = new System.Drawing.Point(0, 0);
+                //cbSplitTranslation.CheckedChanged += new EventHandler(cbSplitTranslation_CheckedChanged);  
+                configPanel.Controls.AddRange(new Control[] { cbSplitTranslation });
+            }
             return false;
         }
+
+
+
+        private void cbSplitTranslation_CheckedChanged(object sender, EventArgs e)
+        {
+            CheckBox cb = (CheckBox)sender;
+            isSplitTranslation = cb.Checked;
+            Console.WriteLine($"isSplitTranslation changed -> {isSplitTranslation}");
+        }
+
 
         // called by MusicBee when the user clicks Apply or Save in the MusicBee Preferences screen.
         // its up to you to figure out whether anything has changed and needs updating
         public void SaveSettings()
         {
+            isSplitTranslation = cbSplitTranslation.Checked;
+
+            File.WriteAllText(dataPath, "SplitTranslation:" + isSplitTranslation.ToString());
         }
 
         // MusicBee is closing the plugin (plugin is being disabled by user or MusicBee is shutting down)
@@ -570,7 +628,7 @@ namespace MusicBeePlugin
                     // Handle WebSocket connection asynchronously
                     Debug.WriteLine($"WebSocket connection request for path: {path}");
                     // Don't dispose client here - WebSocketClient will handle it
-                    var webSocketClient = new WebSocketClient(client, webSocketClients, mbApiInterface, jsonSerializer);
+                    var webSocketClient = new WebSocketClient(client, webSocketClients, mbApiInterface, jsonSerializer, this);
                     webSocketClients.Add(webSocketClient);
                     Task.Run(() => webSocketClient.Handle(request));
                 }
@@ -638,29 +696,38 @@ namespace MusicBeePlugin
             BroadcastMessage(trackInfo);
         }
 
+        public string GetProcessedLyrics()
+        {
+            string lrc = null;
+            try
+            {
+                // Try to get lyrics using MusicBee API
+                lrc = mbApiInterface.NowPlaying_GetLyrics();
+
+                // If no lyrics found, try downloaded lyrics
+                if (string.IsNullOrEmpty(lrc))
+                {
+                    lrc = mbApiInterface.NowPlaying_GetDownloadedLyrics();
+                }
+
+                if (isSplitTranslation)
+                    lrc = SplitTranslation(lrc);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Error getting lyrics: {ex.Message}");
+            }
+
+            return lrc;
+        }
+
         private void BroadcastLyricInfo()
         {
             var url = mbApiInterface.NowPlaying_GetFileUrl();
             if (url == null)
                 return;
 
-            // Get lyrics from MusicBee
-            string lrc = null;
-            try
-            {
-                // Try to get lyrics using MusicBee API
-                lrc = mbApiInterface.NowPlaying_GetLyrics();
-                
-                // If no lyrics found, try downloaded lyrics
-                if (string.IsNullOrEmpty(lrc))
-                {
-                    lrc = mbApiInterface.NowPlaying_GetDownloadedLyrics();
-                }
-            }
-            catch (Exception ex)
-            {
-                Debug.WriteLine($"Error getting lyrics: {ex.Message}");
-            }
+            string lrc = GetProcessedLyrics();
 
             var lyricInfo = new
             {
@@ -675,9 +742,54 @@ namespace MusicBeePlugin
             BroadcastMessage(lyricInfo);
         }
 
+
+        public static string SplitTranslation(string text)
+        {
+            var lines = text.Split('\n');
+            StringBuilder sb = new StringBuilder();
+            int addline = 0;
+            foreach (var line in lines)
+            {
+                var v = line.Trim();
+                if (v.Contains("/"))
+                {
+                    var parts = v.Split(new char[] { '/' }, 2);
+                    if (parts.Length == 2 && parts[0].Contains(']'))
+                    {
+                        var part0 = parts[0].Trim();
+                        var timeTag = part0.Split(']')[0];
+                        sb.AppendLine(part0)
+                            .Append(timeTag)
+                            .Append(']')
+                            .AppendLine(parts[1]);
+                        addline += 1;
+                    }
+                    else
+                    {
+                        sb.AppendLine(v);
+                    }
+                }
+                else
+                {
+                    sb.AppendLine(v);
+                }
+            }
+
+            if (addline * 2 > lines.Length)
+            {
+                return sb.ToString();
+            }
+            else
+            {
+                Debug.WriteLine($"Skip SplitTranslation, addline {addline} * 2 < {lines.Length}");
+                return text;
+            }
+
+        }
+
         private void BroadcastPlayerState()
         {
-            var isPaused = mbApiInterface.Player_GetPlayState() == PlayState.Paused;
+            var isPaused = mbApiInterface.Player_GetPlayState() != PlayState.Playing;
             
             var pauseInfo = new
             {
@@ -735,7 +847,7 @@ namespace MusicBeePlugin
         {
             var url = mbApiInterface.NowPlaying_GetFileUrl();
             var hasSong = !string.IsNullOrEmpty(url);
-            var isPaused = mbApiInterface.Player_GetPlayState() == PlayState.Paused;
+            var isPaused = mbApiInterface.Player_GetPlayState() != PlayState.Playing;
             var volumePercent = (int)(mbApiInterface.Player_GetVolume() * 100);
             var currentPosition = mbApiInterface.Player_GetPosition();
             var duration = mbApiInterface.NowPlaying_GetDuration();
@@ -820,14 +932,16 @@ namespace MusicBeePlugin
             private ConcurrentBag<WebSocketClient> clients;
             private MusicBeeApiInterface mbApiInterface;
             private JavaScriptSerializer jsonSerializer;
+            private Plugin plugin;
 
-            public WebSocketClient(TcpClient client, ConcurrentBag<WebSocketClient> clients, MusicBeeApiInterface mbApiInterface, JavaScriptSerializer jsonSerializer)
+            public WebSocketClient(TcpClient client, ConcurrentBag<WebSocketClient> clients, MusicBeeApiInterface mbApiInterface, JavaScriptSerializer jsonSerializer, Plugin plugin)
             {
                 this.client = client;
                 this.stream = client.GetStream();
                 this.clients = clients;
                 this.mbApiInterface = mbApiInterface;
                 this.jsonSerializer = jsonSerializer;
+                this.plugin = plugin;
             }
 
             public async Task Handle(string request)
@@ -949,23 +1063,7 @@ namespace MusicBeePlugin
                 if (url == null)
                     return;
 
-                // Get lyrics from MusicBee
-                string lrc = null;
-                try
-                {
-                    // Try to get lyrics using MusicBee API
-                    lrc = mbApiInterface.NowPlaying_GetLyrics();
-                    
-                    // If no lyrics found, try downloaded lyrics
-                    if (string.IsNullOrEmpty(lrc))
-                    {
-                        lrc = mbApiInterface.NowPlaying_GetDownloadedLyrics();
-                    }
-                }
-                catch (Exception ex)
-                {
-                    Debug.WriteLine($"Error getting lyrics: {ex.Message}");
-                }
+                string lrc = plugin.GetProcessedLyrics();
 
                 var lyricInfo = new
                 {
@@ -982,7 +1080,7 @@ namespace MusicBeePlugin
 
             private void SendPlayerState()
             {
-                var isPaused = mbApiInterface.Player_GetPlayState() == PlayState.Paused;
+                var isPaused = mbApiInterface.Player_GetPlayState() != PlayState.Playing;
                 
                 var pauseInfo = new
                 {
