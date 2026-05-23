@@ -652,13 +652,34 @@ namespace MusicBeePlugin
                     webSocketClients.Add(webSocketClient);
                     Task.Run(() => webSocketClient.Handle(request));
                 }
-                else if (path == "/api/query")
+                else if (path == "/api/query" || path == "/query")
                 {
                     // Handle HTTP request for /api/query
                     using (var writer = new StreamWriter(stream, Encoding.UTF8))
                     {
                         // Return complete player and track information
                         var response = GetPlayerInfoResponse();
+                        writer.WriteLine("HTTP/1.1 200 OK");
+                        writer.WriteLine("Content-Type: application/json");
+                        writer.WriteLine("Content-Length: " + Encoding.UTF8.GetByteCount(response));
+                        writer.WriteLine("Access-Control-Allow-Origin: *");
+                        writer.WriteLine("Access-Control-Allow-Methods: GET, POST, OPTIONS");
+                        writer.WriteLine("Access-Control-Allow-Headers: Content-Type");
+                        writer.WriteLine("Connection: close");
+                        writer.WriteLine();
+                        writer.WriteLine(response);
+                        writer.Flush();
+                    }
+                    client.Close();
+                }
+                else if (path == "/api/query/progress" || path == "/query/progress")
+                {
+                    // Handle HTTP request for /api/query/progress
+                    using (var writer = new StreamWriter(stream, Encoding.UTF8))
+                    {
+                        // Return current playback progress in milliseconds
+                        var progress = mbApiInterface.Player_GetPosition();
+                        var response = jsonSerializer.Serialize(new { progress = progress });
                         writer.WriteLine("HTTP/1.1 200 OK");
                         writer.WriteLine("Content-Type: application/json");
                         writer.WriteLine("Content-Length: " + Encoding.UTF8.GetByteCount(response));
